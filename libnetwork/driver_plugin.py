@@ -255,10 +255,20 @@ def request_address():
             client.assign_ip(ip_address, None, {}, host=hostname)
             ips = [ip_address]
         except AlreadyAssignedError:
-            error_message = "The address %s is already in " \
-                            "use" % str(ip_address)
-            app.logger.error(error_message)
-            raise Exception(error_message)
+            # TODO: make this configurable
+            app.logger.debug("Releasing in-use IP and assigning to this node")
+            if client.release_ips({ip_address}):
+                error_message = "The address %s could not be released from its " \
+                                "current workload." % str(ip_address)
+                raise Exception(error_message)
+            # Retry address assignment
+            try:
+                client.assign_ip(ip_address, None, {}, host=hostname)
+                ips = [ip_address]
+            except AlreadyAssignedError:
+                error_message = "The address %s is already in " \
+                                "use despite being released" % str(ip_address)
+                raise Exception(error_message)
         except PoolNotFound:
             error_message = "The address %s is not in one of the configured " \
                             "Calico IP pools" % str(ip_address)
