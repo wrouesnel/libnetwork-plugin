@@ -13,18 +13,21 @@ import (
 	caliconet "github.com/projectcalico/libcalico-go/lib/net"
 	logutils "github.com/projectcalico/libnetwork-plugin/utils/log"
 	osutils "github.com/projectcalico/libnetwork-plugin/utils/os"
+	"github.com/projectcalico/libnetwork-plugin/orchestration"
 )
 
 type IpamDriver struct {
 	client *datastoreClient.Client
+	orchestrator *orchestration.Orchestrator
 
 	poolIDV4 string
 	poolIDV6 string
 }
 
-func NewIpamDriver(client *datastoreClient.Client) ipam.Ipam {
+func NewIpamDriver(client *datastoreClient.Client, orchestrator *orchestration.Orchestrator) ipam.Ipam {
 	return IpamDriver{
 		client: client,
+		orchestrator: orchestrator,
 
 		poolIDV4: PoolIDV4,
 		poolIDV6: PoolIDV6,
@@ -165,6 +168,18 @@ func (i IpamDriver) RequestAddress(request *ipam.RequestAddressRequest) (*ipam.R
 			},
 		)
 
+		// If orchestrator enabled, challenge the IP *before* attempting to assign to give a chance to clear it out.
+		if i.orchestrator != nil {
+			// Challenge all the IPs we just received
+			for _, ip := range append(IPsV4, IPsV6...) {
+				if err := i.orchestrator.ChallengeIP(ip.IP); err != nil {
+					err = errors.Wrapf(err, "IP address being actively used by another node: %v", ip)
+					return nil, err
+				}
+				// Challenge successful, we are the owner and holding the lock on this IP.
+			}
+		}
+
 		if err != nil {
 			err = errors.Wrapf(err, "IP assignment error")
 			log.Errorln(err)
@@ -181,6 +196,18 @@ func (i IpamDriver) RequestAddress(request *ipam.RequestAddressRequest) (*ipam.R
 			IP:       caliconet.IP{IP: ip},
 			Hostname: hostname,
 		}
+
+		// If orchestrator enabled, challenge the IP *before* attempting to assign to give a chance to clear it out.
+		if i.orchestrator != nil {
+			if err := i.orchestrator.ChallengeIP(ip); err != nil {
+				err = errors.Wrapf(err, "IP address being actively used by another node: %v", ip)
+				return nil, err
+			}
+			// Challenge successful, we are the owner and holding the lock on this IP.
+		}
+
+		// TODO: just because we hold the lock, doesn't mean we actually own it yet. Check if we own it, and release
+		// if something else is recorded as using it.
 		err := i.client.IPAM().AssignIP(ipArgs)
 		if err != nil {
 			err = errors.Wrapf(err, "IP assignment error, data: %+v", ipArgs)
@@ -212,6 +239,12 @@ func (i IpamDriver) ReleaseAddress(request *ipam.ReleaseAddressRequest) error {
 	logutils.JSONMessage("ReleaseAddress", request)
 
 	ip := caliconet.IP{IP: net.ParseIP(request.Address)}
+
+	// If orchestrator enabled, resign the IP
+	if i.orchestrator != nil {
+		// Currently this will never fail.
+		i.orchestrator.ReleaseIP(net.ParseIP(request.Address))
+	}
 
 	// Unassign the address.  This handles the address already being unassigned
 	// in which case it is a no-op.

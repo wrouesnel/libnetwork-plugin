@@ -19,12 +19,15 @@ import (
 	mathutils "github.com/projectcalico/libnetwork-plugin/utils/math"
 	"github.com/projectcalico/libnetwork-plugin/utils/netns"
 	osutils "github.com/projectcalico/libnetwork-plugin/utils/os"
+
+	"github.com/projectcalico/libnetwork-plugin/orchestration"
 )
 
 // NetworkDriver is the Calico network driver representation.
 // Must be used with Calico IPAM and supports IPv4 only.
 type NetworkDriver struct {
 	client         *datastoreClient.Client
+	orchestrator *orchestration.Orchestrator
 	containerName  string
 	orchestratorID string
 	fixedMac       string
@@ -37,9 +40,10 @@ type NetworkDriver struct {
 	DummyIPV4Nexthop string
 }
 
-func NewNetworkDriver(client *datastoreClient.Client) network.Driver {
+func NewNetworkDriver(client *datastoreClient.Client, orchestrator *orchestration.Orchestrator) network.Driver {
 	return NetworkDriver{
 		client: client,
+		orchestrator: orchestrator,
 
 		// The MAC address of the interface in the container is arbitrary, so for
 		// simplicity, use a fixed MAC.

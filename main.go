@@ -2,6 +2,9 @@ package main
 
 import (
 	"os"
+	"fmt"
+	"flag"
+	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/go-plugins-helpers/ipam"
@@ -9,10 +12,9 @@ import (
 	"github.com/projectcalico/libcalico-go/lib/api"
 	"github.com/projectcalico/libnetwork-plugin/driver"
 
-	"flag"
-
 	datastoreClient "github.com/projectcalico/libcalico-go/lib/client"
-	"fmt"
+
+	"github.com/projectcalico/libnetwork-plugin/orchestration"
 )
 
 const (
@@ -55,6 +57,11 @@ func main() {
 	flagSet := flag.NewFlagSet("Calico", flag.ExitOnError)
 
 	version := flagSet.Bool("v", false, "Display version")
+	// Orchestrator settings
+	orchestratorEnable := flagSet.Bool("orchestrator.enable", false, "Enable workload orchestration functionality")
+	orchestratorTTL := flagSet.Duration("orchestrator.ttl", time.Second*15, "TTL of IP address contentions")
+	orchestratorCanKill := flagSet.Bool("orchestrator.kill-workloads", false, "Allow orchestrator to kill Docker containers which lose elections")
+
 	err := flagSet.Parse(os.Args[1:])
 	if err != nil {
 		log.Fatalln(err)
@@ -66,9 +73,20 @@ func main() {
 
 	initializeClient()
 
+	var orchestrator *orchestration.Orchestrator
+	if *orchestratorEnable {
+		orchestrator, err = orchestration.NewOrchestrator(config, client, *orchestratorTTL, *orchestratorCanKill)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		if orchestrator == nil {
+			log.Fatalln("Orchestrator initialization failed.")
+		}
+	}
+
 	errChannel := make(chan error)
-	networkHandler := network.NewHandler(driver.NewNetworkDriver(client))
-	ipamHandler := ipam.NewHandler(driver.NewIpamDriver(client))
+	networkHandler := network.NewHandler(driver.NewNetworkDriver(client, orchestrator))
+	ipamHandler := ipam.NewHandler(driver.NewIpamDriver(client, orchestrator))
 
 	go func(c chan error) {
 		log.Infoln("calico-net has started.")
