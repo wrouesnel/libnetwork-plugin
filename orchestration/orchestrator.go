@@ -10,6 +10,7 @@ import (
 	"time"
 	"path"
 	"strings"
+	"net"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
@@ -19,11 +20,10 @@ import (
 	"github.com/docker/libkv/store/etcd"
 
 	"github.com/docker/leadership"
-	osutils "github.com/projectcalico/libnetwork-plugin/utils/os"
+	//osutils "github.com/projectcalico/libnetwork-plugin/utils/os"
 	datastoreClient "github.com/projectcalico/libcalico-go/lib/client"
 	"github.com/projectcalico/libcalico-go/lib/api"
-
-	"net"
+	"github.com/satori/go.uuid"
 )
 
 func init() {
@@ -65,7 +65,7 @@ type Orchestrator struct {
 // NewOrchestrator initializes a new orchestrator. endpoints is a list of etcd endpoints, clusterConfig is the libkv
 // storeConfig, challengeTimeout is the maximum amount of time to wait for responses to a challenge.
 func NewOrchestrator(config *api.CalicoAPIConfig, calicoClient *datastoreClient.Client, challengeTimeout time.Duration, enableKillWorkloads bool) (*Orchestrator, error) {
-	//logCtx := log.WithField("component", "orchestrator")
+	logCtx := log.WithField("component", "orchestrator")
 
 	// Can't use the kubernetes backend with libkv yet. Might be an idea to add it.
 	if config.Spec.DatastoreType != api.EtcdV2 {
@@ -75,12 +75,14 @@ func NewOrchestrator(config *api.CalicoAPIConfig, calicoClient *datastoreClient.
 	// Convert Calico config spec to endpoints...
 	var endpoints []string
 	if config.Spec.EtcdEndpoints != "" {
-		endpoints = store.CreateEndpoints(strings.Split(config.Spec.EtcdEndpoints, ","), config.Spec.EtcdScheme)
+		endpoints = strings.Split(config.Spec.EtcdEndpoints, ",")
 	} else if config.Spec.EtcdAuthority != "" {
-		endpoints = store.CreateEndpoints([]string{config.Spec.EtcdAuthority}, config.Spec.EtcdScheme)
+		endpoints = []string{config.Spec.EtcdAuthority}
 	} else {
 		return nil, errors.New("no etcd endpoint specified in ETCD_ENDPOINTS or ETCD_AUTHORITY.")
 	}
+
+	logCtx.Debugln("etcd endpoints:", endpoints)
 
 	var clusterTLS *store.ClientTLSConfig
 	if config.Spec.EtcdScheme == "https" {
@@ -103,6 +105,12 @@ func NewOrchestrator(config *api.CalicoAPIConfig, calicoClient *datastoreClient.
 		return nil, errors.Wrapf(err, "Error setting up orchestrator datastore")
 	}
 
+	testKey := path.Join(OrchestratorRootKey, uuid.NewV4().String())
+	logCtx.Debugln("Writing test key:", testKey)
+	if err := client.Put(testKey, []byte{}, &store.WriteOptions{false, challengeTimeout}); err != nil {
+		return nil, errors.Wrapf(err, "Error writing a test key to data store.")
+	}
+
 	return &Orchestrator{
 		calicoClient: calicoClient,
 		client: client,
@@ -121,21 +129,22 @@ func (this *Orchestrator) log() *log.Entry {
 // until requested to terminate.
 func (this *Orchestrator) ChallengeIP(ip net.IP) error {
 	logCtx := this.log().WithField("ip", ip)
+
+	defer func() {
+		if recover() != nil {
+			logCtx.Debugln("Caught panic in ChallengeIP")
+		}
+	}()
+
 	ipStr := ip.String()
 	// Calculate unique IP store path.
 	storePath := path.Join(OrchestratorRootKey, IPSubkey, ipStr)
-
-	hostname, err := osutils.GetHostname()
-	if err != nil {
-		err = errors.Wrap(err, "Hostname fetching error")
-		log.Errorln(err)
-		return err
-	}
+	log.Debugln("Store path:", storePath)
 
 	// Note: could consider doing a load short-circuit here if the IP is local.
 
 	// Create a new candidate request
-	candidate := leadership.NewCandidate(this.client, storePath, hostname, this.challengeTimeout)
+	candidate := leadership.NewCandidate(this.client, storePath, uuid.NewV4().String(), this.challengeTimeout)
 
 	logCtx.Debugln("Running for election")
 	electedCh, errCh := candidate.RunForElection()
@@ -143,29 +152,31 @@ func (this *Orchestrator) ChallengeIP(ip net.IP) error {
 	// we want to just fail the workload.
 	select {
 	case err := <- errCh:
+		logCtx.Debugln("Error before election:", err)
 		return errors.Wrapf(err, "Error before election for IP: %s", ipStr)
 	case firstResult := <- electedCh:
 		// Discard since it will always be false.
 		logCtx.Debugln("Discarding first election result:", firstResult)
 	}
 
-	logCtx.Debug("Waiting for leadership challenge")
+	logCtx.Debugln("Waiting for leadership challenge")
 	// Wait for the real election result to see if anyone else wants the IP.
 	var electionSuccess bool
 	select {
-	case <- errCh:
+	case err := <- errCh:
+		logCtx.Debugln("Error before election:", err)
 		return errors.Wrapf(err, "Error before election for IP: %s", ipStr)
 	case electionSuccess = <- electedCh:
 		logCtx.Debugln("Election Result:", electionSuccess)
 	}
 
 	if !electionSuccess {
-		logCtx.Debug("Lost election.")
+		logCtx.Debugln("Lost election.")
 		return &ErrAddressInUse{
 			ip : ipStr,
 		}
 	}
-	logCtx.Debug("Won election.")
+	logCtx.Debugln("Won election.")
 
 	// We won the election, but we need to hold onto the IP for the workload duration.
 	doneCh := make(chan interface{})
@@ -179,10 +190,10 @@ func (this *Orchestrator) ChallengeIP(ip net.IP) error {
 					logCtx.Warnln("Lost election on owned IP (network partition?).")
 				}
 			case err := <- errCh:
-				logCtx.Errorf("Error during election: %v", err)
+				logCtx.Errorln("Error during election: %v", err)
 			case <- doneCh:
-				logCtx.Info("Resigning leadership by request.")
-				candidate.Resign()
+				logCtx.Infoln("Resigning leadership by request and exiting.")
+				candidate.Stop()
 				return
 			}
 		}

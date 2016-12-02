@@ -59,7 +59,7 @@ func main() {
 	version := flagSet.Bool("v", false, "Display version")
 	// Orchestrator settings
 	orchestratorEnable := flagSet.Bool("orchestrator.enable", false, "Enable workload orchestration functionality")
-	orchestratorTTL := flagSet.Duration("orchestrator.ttl", time.Second*15, "TTL of IP address contentions")
+	orchestratorTTL := flagSet.Duration("orchestrator.ttl", time.Second, "TTL of IP address contentions")
 	orchestratorCanKill := flagSet.Bool("orchestrator.kill-workloads", false, "Allow orchestrator to kill Docker containers which lose elections")
 
 	err := flagSet.Parse(os.Args[1:])
@@ -82,6 +82,7 @@ func main() {
 		if orchestrator == nil {
 			log.Fatalln("Orchestrator initialization failed.")
 		}
+		log.Infoln("orchestrator is ready.")
 	}
 
 	errChannel := make(chan error)
