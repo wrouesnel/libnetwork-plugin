@@ -24,6 +24,9 @@ import (
 	datastoreClient "github.com/projectcalico/libcalico-go/lib/client"
 	"github.com/projectcalico/libcalico-go/lib/api"
 	"github.com/satori/go.uuid"
+	dockerClient "github.com/docker/engine-api/client"
+	"github.com/docker/engine-api/types"
+	"golang.org/x/net/context"
 )
 
 func init() {
@@ -38,14 +41,14 @@ const (
 
 // ErrAddressInUse is returned from ChallengeIP when an address can't be assigned.
 type ErrAddressInUse struct {
-	ip string
+	ip net.IP
 }
 
 func (this ErrAddressInUse) Error() string {
-	return fmt.Sprintf("Address already in use: %s", this.ip)
+	return fmt.Sprintf("Address already in use: %s", this.ip.String())
 }
 
-// An orchestrator manages the collection of Calico IP endpoints the plugin has assigned by holding leadership
+// Orchestrator manages the collection of Calico IP endpoints the plugin has assigned by holding leadership
 // on their IP addresses in the backend. It will also (optionally) kill docker workloads for which it loses control
 // of the key.
 type Orchestrator struct {
@@ -56,15 +59,13 @@ type Orchestrator struct {
 	ips map[string]chan<- interface{}
 	// maximum time to wait for leadership
 	challengeTimeout time.Duration
-	// if set, the orchestrator will scan for and kill workloads for which it has lost control of an IP globally.
-	enableKillWorkloads bool
 	// mutex to protect the IP map.
 	ipsMtx sync.RWMutex
 }
 
 // NewOrchestrator initializes a new orchestrator. endpoints is a list of etcd endpoints, clusterConfig is the libkv
 // storeConfig, challengeTimeout is the maximum amount of time to wait for responses to a challenge.
-func NewOrchestrator(config *api.CalicoAPIConfig, calicoClient *datastoreClient.Client, challengeTimeout time.Duration, enableKillWorkloads bool) (*Orchestrator, error) {
+func NewOrchestrator(config *api.CalicoAPIConfig, calicoClient *datastoreClient.Client, challengeTimeout time.Duration) (*Orchestrator, error) {
 	logCtx := log.WithField("component", "orchestrator")
 
 	// Can't use the kubernetes backend with libkv yet. Might be an idea to add it.
@@ -116,7 +117,6 @@ func NewOrchestrator(config *api.CalicoAPIConfig, calicoClient *datastoreClient.
 		client: client,
 		ips: make(map[string]chan<- interface{}),
 		challengeTimeout: challengeTimeout,
-		enableKillWorkloads: enableKillWorkloads,
 	}, nil
 }
 
@@ -124,85 +124,142 @@ func (this *Orchestrator) log() *log.Entry {
 	return log.WithField("component", "orchestrator")
 }
 
-// ChallengeIP informs the orchestrator to start a leadership challenge for an IP address. If it succeeds then it
-// returns nil, otherwise an error. Successful elections spawn a goroutine which continues to hold the leadership
+// ChallengeIP informs the orchestrator to start a leadership challenge for an
+// IP address. If it succeeds then it returns nil, otherwise an error.
+// Successful elections spawn a goroutine which continues to hold the leadership
 // until requested to terminate.
 func (this *Orchestrator) ChallengeIP(ip net.IP) error {
-	logCtx := this.log().WithField("ip", ip)
+	// Each IP challenge is functionally a new request, and needs a unique ID
+	// for the contender (even if it might be a local one).
+	contenderId := uuid.NewV4().String()
+	// The store path is a key under the orchestrator key which is just the IP
+	// address.
+	electionKey := path.Join(OrchestratorRootKey, IPSubkey, ip.String())
 
-	defer func() {
-		if recover() != nil {
-			logCtx.Debugln("Caught panic in ChallengeIP")
-		}
-	}()
-
-	ipStr := ip.String()
-	// Calculate unique IP store path.
-	storePath := path.Join(OrchestratorRootKey, IPSubkey, ipStr)
-	log.Debugln("Store path:", storePath)
-
-	// Note: could consider doing a load short-circuit here if the IP is local.
+	logCtx := this.log().WithField("ip", ip).
+		WithField("contenderId", contenderId).
+		WithField("electionKey", electionKey)
 
 	// Create a new candidate request
-	candidate := leadership.NewCandidate(this.client, storePath, uuid.NewV4().String(), this.challengeTimeout)
+	candidate := leadership.NewCandidate(this.client, electionKey,
+		contenderId, this.challengeTimeout)
 
-	logCtx.Debugln("Running for election")
+	logCtx.Infoln("Starting IP address election")
 	electedCh, errCh := candidate.RunForElection()
-	// Leadership should always produce an initial failure, but we might also get an error. If we get an error then
-	// we want to just fail the workload.
+	// Leadership should always produce an initial failure, but we might also
+	// get an error. If we get an error then we want to just fail the workload
+	// and let whoever wants to start it know right away.
 	select {
 	case err := <- errCh:
 		logCtx.Debugln("Error before election:", err)
-		return errors.Wrapf(err, "Error before election for IP: %s", ipStr)
+		return errors.Wrapf(err, "Error before election for IP: %s", ip.String())
 	case firstResult := <- electedCh:
 		// Discard since it will always be false.
 		logCtx.Debugln("Discarding first election result:", firstResult)
 	}
 
-	logCtx.Debugln("Waiting for leadership challenge")
+	logCtx.Debugln("Waiting for real election...")
 	// Wait for the real election result to see if anyone else wants the IP.
 	var electionSuccess bool
 	select {
 	case err := <- errCh:
 		logCtx.Debugln("Error before election:", err)
-		return errors.Wrapf(err, "Error before election for IP: %s", ipStr)
+		return errors.Wrapf(err, "Error before election for IP: %s", ip.String())
 	case electionSuccess = <- electedCh:
 		logCtx.Debugln("Election Result:", electionSuccess)
 	}
 
 	if !electionSuccess {
-		logCtx.Debugln("Lost election.")
+		logCtx.Infoln("Lost election for IP.")
 		return &ErrAddressInUse{
-			ip : ipStr,
+			ip : ip,
 		}
 	}
-	logCtx.Debugln("Won election.")
+	logCtx.Infoln("Won election for IP.")
 
-	// We won the election, but we need to hold onto the IP for the workload duration.
 	doneCh := make(chan interface{})
-	go func() {
+	go func(ip net.IP) {
 		for {
-			select {
-			case electionSuccess := <- electedCh:
-				// Somehow we lost leadership, which means another orchestrator is going to be trying to start up a
-				// workload on this IP address. We need to release the IP and possibly kill our local workload.
-				if !electionSuccess {
-					logCtx.Warnln("Lost election on owned IP (network partition?).")
+			innerLoop: for {
+				select {
+				case electionSuccess := <-electedCh:
+					if electionSuccess {
+						continue
+					}
+					logCtx.Warnln("Lost election on owned IP.")
+					// TODO: Lost leadership. Release IP (if we have it) in Calico.
+					dockerCli, err := dockerClient.NewEnvClient()
+					if err != nil {
+						err = errors.Wrap(err, "Error while attempting to instantiate docker client from env")
+						logCtx.Errorln(err)
+						return
+					}
+					// List all containers (since we don't know which containers
+					// we were associated with) and kill any which are running
+					// with the IP we have.
+					containers, err := dockerCli.ContainerList(context.Background(),
+						types.ContainerListOptions{})
+
+					if err != nil {
+						// TODO: dump these into a list so we can retry until we succeed
+						err = errors.Wrap(err, "Error listing containers to remove.")
+						logCtx.Errorln(err)
+					}
+					// This could be cleaned up, but I have no idea how which
+					// of these many addresses will be populated, or who thorough
+					// we should be. Since this is Calico, we're assuming all
+					// containers on this host should be the right.
+					for _, container := range containers {
+						if container.NetworkSettings == nil {
+							continue
+						}
+						if container.NetworkSettings.Networks == nil {
+							continue
+						}
+						killContainer := false
+						for _, nsettings := range container.NetworkSettings.Networks {
+							switch ip.String() {
+							case nsettings.IPAddress, nsettings.GlobalIPv6Address:
+								killContainer = true
+								break
+							}
+
+							if nsettings.IPAMConfig == nil {
+								continue
+							}
+							switch ip.String() {
+							case nsettings.IPAMConfig.IPv4Address, nsettings.IPAMConfig.IPv6Address:
+								killContainer = true
+								break
+							}
+						}
+						// Container on this host has this IP and it shouldn't
+						// kill it.
+						if killContainer {
+							if err := dockerCli.ContainerKill(context.Background(), container.ID, "SIGKILL"); err != nil {
+								log.Errorln(errors.Wrapf(err, "Error sending container kill."))
+							}
+						}
+					}
+				case err := <-errCh:
+					logCtx.Errorln("Error during election: %v", err)
+					break innerLoop
+				case <-doneCh:
+					logCtx.Infoln("Workload shutting down and stopping contention.")
+					candidate.Stop()
+					return
 				}
-			case err := <- errCh:
-				logCtx.Errorln("Error during election: %v", err)
-			case <- doneCh:
-				logCtx.Infoln("Resigning leadership by request and exiting.")
-				candidate.Stop()
-				return
 			}
+			logCtx.Infoln("Restarting workload contention due to backend error")
+			electedCh, errCh = candidate.RunForElection()
 		}
-	}()
+	}(ip)
+
 	// Add the done channel to the interface so we can signal releases.
 	this.ipsMtx.Lock()
-	this.ips[ipStr] = doneCh
+	this.ips[ip.String()] = doneCh
 	this.ipsMtx.Unlock()
-	logCtx.Debugln("Added IP to orchestrator.")
+	logCtx.Infoln("Add IP to orchestrator.")
 
 	return nil
 }

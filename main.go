@@ -15,6 +15,7 @@ import (
 	datastoreClient "github.com/projectcalico/libcalico-go/lib/client"
 
 	"github.com/projectcalico/libnetwork-plugin/orchestration"
+	"strconv"
 )
 
 const (
@@ -25,6 +26,9 @@ const (
 var (
 	config *api.CalicoAPIConfig
 	client *datastoreClient.Client
+	// Orchestrator configuration
+	orchestratorEnable bool = false
+	orchestratorTTL time.Duration = time.Second * 30
 )
 
 func init() {
@@ -46,6 +50,20 @@ func initializeClient() {
 		log.SetLevel(log.DebugLevel)
 		log.Debugln("Debug logging enabled")
 	}
+
+	if os.Getenv("ORCHESTRATOR") != "" {
+		orchestratorEnable, err = strconv.ParseBool(os.Getenv("ORCHESTRATOR"))
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	if orchestratorEnable && os.Getenv("ORCHESTRATOR_TTL") != "" {
+		orchestratorTTL, err = time.ParseDuration(os.Getenv("ORCHESTRATOR_TTL"))
+		if err != nil {
+			panic(err)
+		}
+	}
 }
 
 // VERSION is filled out during the build process (using git describe output)
@@ -57,10 +75,6 @@ func main() {
 	flagSet := flag.NewFlagSet("Calico", flag.ExitOnError)
 
 	version := flagSet.Bool("v", false, "Display version")
-	// Orchestrator settings
-	orchestratorEnable := flagSet.Bool("orchestrator.enable", false, "Enable workload orchestration functionality")
-	orchestratorTTL := flagSet.Duration("orchestrator.ttl", time.Second, "TTL of IP address contentions")
-	orchestratorCanKill := flagSet.Bool("orchestrator.kill-workloads", false, "Allow orchestrator to kill Docker containers which lose elections")
 
 	err := flagSet.Parse(os.Args[1:])
 	if err != nil {
@@ -74,8 +88,8 @@ func main() {
 	initializeClient()
 
 	var orchestrator *orchestration.Orchestrator
-	if *orchestratorEnable {
-		orchestrator, err = orchestration.NewOrchestrator(config, client, *orchestratorTTL, *orchestratorCanKill)
+	if orchestratorEnable {
+		orchestrator, err = orchestration.NewOrchestrator(config, client, orchestratorTTL)
 		if err != nil {
 			log.Fatalln(err)
 		}
